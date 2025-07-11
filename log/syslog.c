@@ -49,12 +49,120 @@ static int current_id = 0;
 static regex_t pat_prio;
 static regex_t pat_tstamp;
 
+/* Rate limiting variables */
+static struct rate_limit_entry *rate_limit_table = NULL;
+static struct uloop_timeout rate_limit_timer;
+int rate_limit_threshold = RATE_LIMIT_THRESHOLD;
+int rate_limit_timeframe = RATE_LIMIT_TIMEFRAME;
+int rate_limit_report_interval = RATE_LIMIT_REPORT_INTERVAL;
+
 static struct log_head*
 log_next(struct log_head *h, int size)
 {
 	struct log_head *n = (struct log_head *) &h->data[PAD(size)];
 
 	return (n >= log_end) ? (log) : (n);
+}
+
+/* Simple hash function for message deduplication */
+static void
+get_msg_hash(const char *msg, char *hash, size_t hash_size)
+{
+	unsigned int h = 5381;
+	const char *p = msg;
+
+	/* Skip timestamp-like patterns at the beginning */
+	while (*p && (*p == '[' || isdigit(*p) || *p == '.' || *p == ']' || isspace(*p)))
+		p++;
+
+	while (*p) {
+		h = ((h << 5) + h) + *p;
+		p++;
+	}
+
+	snprintf(hash, hash_size, "%u", h);
+}
+
+/* Find or create rate limit entry */
+static struct rate_limit_entry*
+rate_limit_find_or_create(const char *hash)
+{
+	struct rate_limit_entry *entry = rate_limit_table;
+	struct rate_limit_entry *prev = NULL;
+	time_t now = time(NULL);
+
+	/* Find existing entry */
+	while (entry) {
+		if (strcmp(entry->msg_hash, hash) == 0) {
+			/* Reset if outside timeframe */
+			if (now - entry->first_seen > rate_limit_timeframe) {
+				entry->count = 0;
+				entry->first_seen = now;
+			}
+			return entry;
+		}
+		prev = entry;
+		entry = entry->next;
+	}
+
+	/* Create new entry */
+	entry = calloc(1, sizeof(struct rate_limit_entry));
+	if (!entry)
+		return NULL;
+
+	strncpy(entry->msg_hash, hash, sizeof(entry->msg_hash) - 1);
+	entry->first_seen = now;
+	entry->count = 0;
+
+	if (prev)
+		prev->next = entry;
+	else
+		rate_limit_table = entry;
+
+	return entry;
+}
+
+/* Rate limit timer callback */
+static void
+rate_limit_timer_cb(struct uloop_timeout *timeout)
+{
+	struct rate_limit_entry *entry = rate_limit_table;
+	struct rate_limit_entry *prev = NULL;
+	struct rate_limit_entry *next;
+	time_t now = time(NULL);
+	char buf[256];
+
+	while (entry) {
+		next = entry->next;
+
+		/* Report suppressed messages */
+		if (entry->count > rate_limit_threshold) {
+			snprintf(buf, sizeof(buf),
+				"Rate limit: suppressed %d similar messages in last %d seconds",
+				entry->count - rate_limit_threshold, rate_limit_report_interval);
+
+			/* Add internal log message */
+			struct log_head *saved_newest = newest;
+			log_add(buf, strlen(buf) + 1, SOURCE_INTERNAL);
+			newest = saved_newest;
+		}
+
+		/* Clean up old entries */
+		if (now - entry->last_seen > rate_limit_report_interval) {
+			if (prev)
+				prev->next = next;
+			else
+				rate_limit_table = next;
+			free(entry);
+		} else {
+			prev = entry;
+		}
+
+		entry = next;
+	}
+
+	/* Re-arm timer */
+	uloop_timeout_set(&rate_limit_timer, rate_limit_report_interval * 1000);
 }
 
 void
@@ -65,6 +173,9 @@ log_add(char *buf, int size, int source)
 	int priority = 0;
 	int ret;
 	char *c;
+	char msg_hash[64];
+	struct rate_limit_entry *rate_entry;
+	int should_log = 1;
 
 	/* bounce out if we don't have init'ed yet (regmatch etc will blow) */
 	if (!log) {
@@ -107,6 +218,25 @@ log_add(char *buf, int size, int source)
 		size -= SYSLOG_PADDING;
 		buf += SYSLOG_PADDING;
 	}
+
+	/* Rate limiting check */
+	if (source != SOURCE_INTERNAL) {
+		get_msg_hash(buf, msg_hash, sizeof(msg_hash));
+		rate_entry = rate_limit_find_or_create(msg_hash);
+
+		if (rate_entry) {
+			rate_entry->count++;
+			rate_entry->last_seen = time(NULL);
+
+			/* Suppress message if over threshold */
+			if (rate_entry->count > rate_limit_threshold) {
+				should_log = 0;
+			}
+		}
+	}
+
+	if (!should_log)
+		return;
 
 	//fprintf(stderr, "-> %d - %s\n", priority, buf);
 
@@ -292,9 +422,27 @@ log_init(int _log_size)
 		exit(-1);
 	}
 
+	/* Initialize rate limit timer */
+	rate_limit_timer.cb = rate_limit_timer_cb;
+	uloop_timeout_set(&rate_limit_timer, rate_limit_report_interval * 1000);
+
 	syslog_open();
 	klog_open();
 	openlog("sysinit", LOG_CONS, LOG_DAEMON);
+}
+
+void
+rate_limit_cleanup(void)
+{
+	struct rate_limit_entry *entry = rate_limit_table;
+	struct rate_limit_entry *next;
+
+	while (entry) {
+		next = entry->next;
+		free(entry);
+		entry = next;
+	}
+	rate_limit_table = NULL;
 }
 
 void
@@ -304,6 +452,9 @@ log_shutdown(void)
 		uloop_fd_delete(&syslog_fd);
 		close(syslog_fd.fd);
 	}
+
+	uloop_timeout_cancel(&rate_limit_timer);
+	rate_limit_cleanup();
 
 	ustream_free(&klog.stream);
 	close(klog.fd.fd);

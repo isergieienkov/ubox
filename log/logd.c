@@ -49,6 +49,19 @@ static const struct blobmsg_policy read_policy[__READ_MAX] = {
 static const struct blobmsg_policy write_policy =
 	{ .name = "event", .type = BLOBMSG_TYPE_STRING };
 
+enum {
+	RATE_THRESHOLD,
+	RATE_TIMEFRAME,
+	RATE_REPORT_INTERVAL,
+	__RATE_MAX
+};
+
+static const struct blobmsg_policy rate_policy[__RATE_MAX] = {
+	[RATE_THRESHOLD] = { .name = "threshold", .type = BLOBMSG_TYPE_INT32 },
+	[RATE_TIMEFRAME] = { .name = "timeframe", .type = BLOBMSG_TYPE_INT32 },
+	[RATE_REPORT_INTERVAL] = { .name = "report_interval", .type = BLOBMSG_TYPE_INT32 },
+};
+
 struct client {
 	struct list_head list;
 
@@ -187,9 +200,71 @@ write_log(struct ubus_context *ctx, struct ubus_object *obj,
 	return 0;
 }
 
+static int
+get_rate_limit(struct ubus_context *ctx, struct ubus_object *obj,
+		struct ubus_request_data *req, const char *method,
+		struct blob_attr *msg)
+{
+	blob_buf_init(&b, 0);
+	blobmsg_add_u32(&b, "threshold", rate_limit_threshold);
+	blobmsg_add_u32(&b, "timeframe", rate_limit_timeframe);
+	blobmsg_add_u32(&b, "report_interval", rate_limit_report_interval);
+	ubus_send_reply(ctx, req, b.head);
+	blob_buf_free(&b);
+
+	return 0;
+}
+
+static int
+set_rate_limit(struct ubus_context *ctx, struct ubus_object *obj,
+		struct ubus_request_data *req, const char *method,
+		struct blob_attr *msg)
+{
+	struct blob_attr *tb[__RATE_MAX] = {};
+	bool changed = false;
+
+	if (!msg)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	blobmsg_parse(rate_policy, __RATE_MAX, tb, blob_data(msg), blob_len(msg));
+
+	if (tb[RATE_THRESHOLD]) {
+		int val = blobmsg_get_u32(tb[RATE_THRESHOLD]);
+		if (val >= 1) {
+			rate_limit_threshold = val;
+			changed = true;
+		}
+	}
+
+	if (tb[RATE_TIMEFRAME]) {
+		int val = blobmsg_get_u32(tb[RATE_TIMEFRAME]);
+		if (val >= 1) {
+			rate_limit_timeframe = val;
+			changed = true;
+		}
+	}
+
+	if (tb[RATE_REPORT_INTERVAL]) {
+		int val = blobmsg_get_u32(tb[RATE_REPORT_INTERVAL]);
+		if (val >= 1) {
+			rate_limit_report_interval = val;
+			changed = true;
+		}
+	}
+
+	if (changed) {
+		/* Clean up rate limit table to apply new settings */
+		rate_limit_cleanup();
+	}
+
+	return 0;
+}
+
 static const struct ubus_method log_methods[] = {
 	UBUS_METHOD("read", read_log, read_policy),
 	{ .name = "write", .handler = write_log, .policy = &write_policy, .n_policy = 1 },
+	UBUS_METHOD_NOARG("get_rate_limit", get_rate_limit),
+	UBUS_METHOD("set_rate_limit", set_rate_limit, rate_policy),
 };
 
 static struct ubus_object_type log_object_type =
@@ -244,18 +319,44 @@ main(int argc, char **argv)
 {
 	int ch, log_size = 16;
 	struct passwd *p = NULL;
+	int rate_threshold = RATE_LIMIT_THRESHOLD;
+	int rate_timeframe = RATE_LIMIT_TIMEFRAME;
+	int rate_report = RATE_LIMIT_REPORT_INTERVAL;
 
 	signal(SIGPIPE, SIG_IGN);
-	while ((ch = getopt(argc, argv, "S:")) != -1) {
+	while ((ch = getopt(argc, argv, "S:T:F:R:")) != -1) {
 		switch (ch) {
 		case 'S':
 			log_size = atoi(optarg);
 			if (log_size < 1)
 				log_size = 16;
 			break;
+		case 'T':
+			rate_threshold = atoi(optarg);
+			if (rate_threshold < 1)
+				rate_threshold = 10;
+			break;
+		case 'F':
+			rate_timeframe = atoi(optarg);
+			if (rate_timeframe < 1)
+				rate_timeframe = 5;
+			break;
+		case 'R':
+			rate_report = atoi(optarg);
+			if (rate_report < 1)
+				rate_report = 10;
+			break;
 		}
 	}
 	log_size *= 1024;
+
+	/* Set rate limit parameters before log_init */
+	extern int rate_limit_threshold;
+	extern int rate_limit_timeframe;
+	extern int rate_limit_report_interval;
+	rate_limit_threshold = rate_threshold;
+	rate_limit_timeframe = rate_timeframe;
+	rate_limit_report_interval = rate_report;
 
 	uloop_init();
 	log_init(log_size);
