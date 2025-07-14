@@ -222,6 +222,7 @@ set_rate_limit(struct ubus_context *ctx, struct ubus_object *obj,
 {
 	struct blob_attr *tb[__RATE_MAX] = {};
 	bool changed = false;
+	char debug_msg[256];
 
 	if (!msg)
 		return UBUS_STATUS_INVALID_ARGUMENT;
@@ -231,6 +232,10 @@ set_rate_limit(struct ubus_context *ctx, struct ubus_object *obj,
 	if (tb[RATE_THRESHOLD]) {
 		int val = blobmsg_get_u32(tb[RATE_THRESHOLD]);
 		if (val >= 1) {
+			snprintf(debug_msg, sizeof(debug_msg),
+				"Rate limit: Setting threshold from %d to %d",
+				rate_limit_threshold, val);
+			log_add(debug_msg, strlen(debug_msg) + 1, SOURCE_INTERNAL);
 			rate_limit_threshold = val;
 			changed = true;
 		}
@@ -239,6 +244,10 @@ set_rate_limit(struct ubus_context *ctx, struct ubus_object *obj,
 	if (tb[RATE_TIMEFRAME]) {
 		int val = blobmsg_get_u32(tb[RATE_TIMEFRAME]);
 		if (val >= 1) {
+			snprintf(debug_msg, sizeof(debug_msg),
+				"Rate limit: Setting timeframe from %d to %d",
+				rate_limit_timeframe, val);
+			log_add(debug_msg, strlen(debug_msg) + 1, SOURCE_INTERNAL);
 			rate_limit_timeframe = val;
 			changed = true;
 		}
@@ -247,12 +256,18 @@ set_rate_limit(struct ubus_context *ctx, struct ubus_object *obj,
 	if (tb[RATE_REPORT_INTERVAL]) {
 		int val = blobmsg_get_u32(tb[RATE_REPORT_INTERVAL]);
 		if (val >= 1) {
+			snprintf(debug_msg, sizeof(debug_msg),
+				"Rate limit: Setting report_interval from %d to %d",
+				rate_limit_report_interval, val);
+			log_add(debug_msg, strlen(debug_msg) + 1, SOURCE_INTERNAL);
 			rate_limit_report_interval = val;
 			changed = true;
 		}
 	}
 
 	if (changed) {
+		log_add("Rate limit: Configuration changed, cleaning up table",
+			strlen("Rate limit: Configuration changed, cleaning up table") + 1, SOURCE_INTERNAL);
 		/* Clean up rate limit table to apply new settings */
 		rate_limit_cleanup();
 	}
@@ -322,6 +337,7 @@ main(int argc, char **argv)
 	int rate_threshold = RATE_LIMIT_THRESHOLD;
 	int rate_timeframe = RATE_LIMIT_TIMEFRAME;
 	int rate_report = RATE_LIMIT_REPORT_INTERVAL;
+	char debug_msg[256];
 
 	signal(SIGPIPE, SIG_IGN);
 	while ((ch = getopt(argc, argv, "S:T:F:R:")) != -1) {
@@ -332,19 +348,19 @@ main(int argc, char **argv)
 				log_size = 16;
 			break;
 		case 'T':
-			rate_threshold = atoi(optarg);
-			if (rate_threshold < 1)
-				rate_threshold = 10;
+			rate_limit_threshold = atoi(optarg);
+			if (rate_limit_threshold < 1)
+				rate_limit_threshold = 10;
 			break;
 		case 'F':
-			rate_timeframe = atoi(optarg);
-			if (rate_timeframe < 1)
-				rate_timeframe = 5;
+			rate_limit_timeframe = atoi(optarg);
+			if (rate_limit_timeframe < 1)
+				rate_limit_timeframe = 5;
 			break;
 		case 'R':
-			rate_report = atoi(optarg);
-			if (rate_report < 1)
-				rate_report = 10;
+			rate_limit_report_interval = atoi(optarg);
+			if (rate_limit_report_interval < 1)
+				rate_limit_report_interval = 10;
 			break;
 		}
 	}
@@ -360,6 +376,13 @@ main(int argc, char **argv)
 
 	uloop_init();
 	log_init(log_size);
+
+	/* Log the initial configuration after log_init */
+	snprintf(debug_msg, sizeof(debug_msg),
+		"Rate limit: Initialized with threshold=%d, timeframe=%d, report_interval=%d",
+		rate_limit_threshold, rate_limit_timeframe, rate_limit_report_interval);
+	log_add(debug_msg, strlen(debug_msg) + 1, SOURCE_INTERNAL);
+
 	conn.cb = ubus_connect_handler;
 	ubus_auto_connect(&conn);
 	p = getpwnam("logd");

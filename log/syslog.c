@@ -90,12 +90,16 @@ rate_limit_find_or_create(const char *hash)
 	struct rate_limit_entry *entry = rate_limit_table;
 	struct rate_limit_entry *prev = NULL;
 	time_t now = time(NULL);
+	char debug_msg[256];
 
 	/* Find existing entry */
 	while (entry) {
 		if (strcmp(entry->msg_hash, hash) == 0) {
 			/* Reset if outside timeframe */
 			if (now - entry->first_seen > rate_limit_timeframe) {
+				snprintf(debug_msg, sizeof(debug_msg),
+					"Rate limit: Resetting hash %s (timeframe expired)", hash);
+				log_add(debug_msg, strlen(debug_msg) + 1, SOURCE_INTERNAL);
 				entry->count = 0;
 				entry->first_seen = now;
 			}
@@ -119,6 +123,9 @@ rate_limit_find_or_create(const char *hash)
 	else
 		rate_limit_table = entry;
 
+	snprintf(debug_msg, sizeof(debug_msg),
+		"Rate limit: Created new entry for hash %s", hash);
+	log_add(debug_msg, strlen(debug_msg) + 1, SOURCE_INTERNAL);
 	return entry;
 }
 
@@ -131,6 +138,11 @@ rate_limit_timer_cb(struct uloop_timeout *timeout)
 	struct rate_limit_entry *next;
 	time_t now = time(NULL);
 	char buf[256];
+	char debug_msg[256];
+	int reported = 0;
+
+	log_add("Rate limit: Timer callback triggered",
+		strlen("Rate limit: Timer callback triggered") + 1, SOURCE_INTERNAL);
 
 	while (entry) {
 		next = entry->next;
@@ -141,14 +153,22 @@ rate_limit_timer_cb(struct uloop_timeout *timeout)
 				"Rate limit: suppressed %d similar messages in last %d seconds",
 				entry->count - rate_limit_threshold, rate_limit_report_interval);
 
+			snprintf(debug_msg, sizeof(debug_msg),
+				"Rate limit: Reporting suppression: %s", buf);
+			log_add(debug_msg, strlen(debug_msg) + 1, SOURCE_INTERNAL);
+
 			/* Add internal log message */
 			struct log_head *saved_newest = newest;
 			log_add(buf, strlen(buf) + 1, SOURCE_INTERNAL);
 			newest = saved_newest;
+			reported++;
 		}
 
 		/* Clean up old entries */
 		if (now - entry->last_seen > rate_limit_report_interval) {
+			snprintf(debug_msg, sizeof(debug_msg),
+				"Rate limit: Cleaning up old entry for hash %s", entry->msg_hash);
+			log_add(debug_msg, strlen(debug_msg) + 1, SOURCE_INTERNAL);
 			if (prev)
 				prev->next = next;
 			else
@@ -160,6 +180,10 @@ rate_limit_timer_cb(struct uloop_timeout *timeout)
 
 		entry = next;
 	}
+
+	snprintf(debug_msg, sizeof(debug_msg),
+		"Rate limit: Timer reported %d suppression messages", reported);
+	log_add(debug_msg, strlen(debug_msg) + 1, SOURCE_INTERNAL);
 
 	/* Re-arm timer */
 	uloop_timeout_set(&rate_limit_timer, rate_limit_report_interval * 1000);
@@ -176,6 +200,7 @@ log_add(char *buf, int size, int source)
 	char msg_hash[64];
 	struct rate_limit_entry *rate_entry;
 	int should_log = 1;
+	char debug_msg[256];
 
 	/* bounce out if we don't have init'ed yet (regmatch etc will blow) */
 	if (!log) {
@@ -222,15 +247,28 @@ log_add(char *buf, int size, int source)
 	/* Rate limiting check */
 	if (source != SOURCE_INTERNAL) {
 		get_msg_hash(buf, msg_hash, sizeof(msg_hash));
+		snprintf(debug_msg, sizeof(debug_msg),
+			"Rate limit: Message hash: %s, msg: %.50s...", msg_hash, buf);
+		log_add(debug_msg, strlen(debug_msg) + 1, SOURCE_INTERNAL);
+
 		rate_entry = rate_limit_find_or_create(msg_hash);
 
 		if (rate_entry) {
 			rate_entry->count++;
 			rate_entry->last_seen = time(NULL);
 
+			snprintf(debug_msg, sizeof(debug_msg),
+				"Rate limit: Count for hash %s: %d (threshold: %d)",
+				msg_hash, rate_entry->count, rate_limit_threshold);
+			log_add(debug_msg, strlen(debug_msg) + 1, SOURCE_INTERNAL);
+
 			/* Suppress message if over threshold */
 			if (rate_entry->count > rate_limit_threshold) {
 				should_log = 0;
+				snprintf(debug_msg, sizeof(debug_msg),
+					"Rate limit: Suppressing message (count %d > threshold %d)",
+					rate_entry->count, rate_limit_threshold);
+				log_add(debug_msg, strlen(debug_msg) + 1, SOURCE_INTERNAL);
 			}
 		}
 	}
@@ -411,6 +449,8 @@ log_buffer_init(int size)
 void
 log_init(int _log_size)
 {
+	char debug_msg[256];
+
 	if (_log_size > 0)
 		log_size = _log_size;
 
@@ -421,6 +461,11 @@ log_init(int _log_size)
 		fprintf(stderr, "Failed to allocate log memory\n");
 		exit(-1);
 	}
+
+	snprintf(debug_msg, sizeof(debug_msg),
+		"Rate limit: Initialized - threshold: %d, timeframe: %d, report_interval: %d",
+		rate_limit_threshold, rate_limit_timeframe, rate_limit_report_interval);
+	log_add(debug_msg, strlen(debug_msg) + 1, SOURCE_INTERNAL);
 
 	/* Initialize rate limit timer */
 	rate_limit_timer.cb = rate_limit_timer_cb;
